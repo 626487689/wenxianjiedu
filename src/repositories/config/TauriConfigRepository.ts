@@ -1,55 +1,34 @@
 import type { AppConfig } from '../../types/config'
 import type { ConfigRepository } from './ConfigRepository'
-
-const CONFIG_STORAGE_KEY = 'literature_interpreter_app_config'
-
-const DEFAULT_APP_CONFIG: AppConfig = {
-  model: {
-    providerType: 'openai_compatible',
-    endpoint: '',
-    endpointMode: 'auto',
-    modelName: '',
-    timeoutMs: 60000,
-  },
-  batch: {
-    concurrency: 1,
-    retryCount: 0,
-    skipExistingOutput: false,
-  },
-  apiKeySaved: false,
-  lastInputPath: '',
-  lastOutputPath: '',
-  recursiveDefault: false,
-}
+import { configManagerService } from '../../services/config/ConfigManagerService'
 
 export class TauriConfigRepository implements ConfigRepository {
   async loadAppConfig(): Promise<AppConfig> {
-    try {
-      const raw = localStorage.getItem(CONFIG_STORAGE_KEY)
-      if (!raw) return DEFAULT_APP_CONFIG
-      const parsed = JSON.parse(raw) as Partial<AppConfig>
-      return {
-        ...DEFAULT_APP_CONFIG,
-        ...parsed,
-        model: {
-          ...DEFAULT_APP_CONFIG.model,
-          ...(parsed.model ?? {}),
-        },
-        batch: {
-          ...DEFAULT_APP_CONFIG.batch,
-          ...(parsed.batch ?? {}),
-        },
-      }
-    } catch {
-      return DEFAULT_APP_CONFIG
-    }
+    return configManagerService.getConfig()
   }
 
   async saveAppConfig(config: AppConfig): Promise<void> {
-    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config))
+    await configManagerService.updateConfig(config)
   }
 
   async resetAppConfig(): Promise<void> {
-    localStorage.removeItem(CONFIG_STORAGE_KEY)
+    await configManagerService.resetConfig()
+  }
+
+  async exportConfig(): Promise<string> {
+    return configManagerService.exportConfig()
+  }
+
+  async importConfig(configJson: string): Promise<void> {
+    await configManagerService.importConfig(configJson)
+  }
+
+  addConfigChangeListener(listener: (event: any) => void): void {
+    configManagerService.addConfigChangeListener(listener)
+  }
+
+  removeConfigChangeListener(listener: (event: any) => void): void {
+    configManagerService.removeConfigChangeListener(listener)
   }
 }
+

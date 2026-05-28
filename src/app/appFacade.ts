@@ -3,13 +3,30 @@ import type { PromptTemplate, ChunkingMetadata } from '../types/prompt'
 import type { SourceFileRef } from '../types/file'
 import type { JobState } from '../types/task'
 import { services } from './services'
+import { errorHandler } from '../services/error/ErrorHandlerService'
+import { versionService } from '../services/version/VersionService'
+
+function withErrorHandling<T extends (...args: any[]) => any>(func: T): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
+  return async (...args: Parameters<T>): Promise<Awaited<ReturnType<T>>> => {
+    try {
+      return await func(...args)
+    } catch (error) {
+      errorHandler.handleError(error)
+      const recovered = errorHandler.attemptRecovery(error)
+      if (!recovered) {
+        throw new Error(errorHandler.formatError(error))
+      }
+      return await func(...args)
+    }
+  }
+}
 
 export const appFacade = {
-  async loadInitialData(): Promise<{
+  loadInitialData: withErrorHandling(async (): Promise<{
     config: AppConfig
     apiKeySaved: boolean
     templates: PromptTemplate[]
-  }> {
+  }> => {
     const [config, templates] = await Promise.all([
       services.useCases.loadModelConfig.execute(),
       services.useCases.listTemplates.execute(),
@@ -30,39 +47,39 @@ export const appFacade = {
       apiKeySaved,
       templates,
     }
-  },
+  }),
 
-  async saveModelConfig(input: {
-    providerType: 'openai_compatible'
+  saveModelConfig: withErrorHandling(async (input: {
+    providerType: 'openai_compatible' | 'anthropic' | 'google' | 'local'
     endpoint: string
     endpointMode: 'auto' | 'manual'
     modelName: string
     apiKey?: string
     rememberApiKey: boolean
     timeoutMs: number
-  }): Promise<void> {
+  }): Promise<void> => {
     await services.useCases.saveModelConfig.execute(input)
-  },
+  }),
 
-  async saveUiPreferences(input: {
+  saveUiPreferences: withErrorHandling(async (input: {
     lastInputPath?: string
     lastOutputPath?: string
     recursiveDefault?: boolean
     concurrency?: number
     retryCount?: number
     skipExistingOutput?: boolean
-  }): Promise<void> {
+  }): Promise<void> => {
     await services.useCases.saveUiPreferences.execute(input)
-  },
+  }),
 
-  async testModelConnection(input: {
-    providerType: 'openai_compatible'
+  testModelConnection: withErrorHandling(async (input: {
+    providerType: 'openai_compatible' | 'anthropic' | 'google' | 'local'
     endpoint: string
     endpointMode: 'auto' | 'manual'
     modelName: string
     timeoutMs: number
     runtimeApiKey?: string
-  }): Promise<{ normalizedEndpoint: string; preview: string }> {
+  }): Promise<{ normalizedEndpoint: string; preview: string }> => {
     return services.useCases.testModelConnection.execute({
       modelConfig: {
         providerType: input.providerType,
@@ -73,51 +90,75 @@ export const appFacade = {
       },
       runtimeApiKey: input.runtimeApiKey,
     })
-  },
+  }),
 
-  async pickSingleFile(): Promise<string | null> {
+  pickSingleFile: withErrorHandling(async (): Promise<string | null> => {
     return services.repositories.fileGateway.pickSingleFile()
-  },
+  }),
 
-  async pickFolder(): Promise<string | null> {
+  pickFolder: withErrorHandling(async (): Promise<string | null> => {
     return services.repositories.fileGateway.pickFolder()
-  },
+  }),
 
-  async pickOutputDirectory(): Promise<string | null> {
+  pickOutputDirectory: withErrorHandling(async (): Promise<string | null> => {
     return services.repositories.fileGateway.pickOutputDirectory()
-  },
+  }),
 
-  async loadFiles(input: {
+  loadFiles: withErrorHandling(async (input: {
     sourcePath: string
     sourceType: 'file' | 'folder'
     recursive: boolean
-  }): Promise<SourceFileRef[]> {
+  }): Promise<SourceFileRef[]> => {
     return services.useCases.loadInputFiles.execute(input)
-  },
+  }),
 
-  async listTemplates(): Promise<PromptTemplate[]> {
+  listTemplates: withErrorHandling(async (): Promise<PromptTemplate[]> => {
     return services.useCases.listTemplates.execute()
-  },
+  }),
 
-  async saveTemplate(input: {
+  saveTemplate: withErrorHandling(async (input: {
     id?: string
     name: string
     content: string
-  }): Promise<PromptTemplate> {
+  }): Promise<PromptTemplate> => {
     return services.useCases.saveTemplate.execute(input)
-  },
+  }),
 
-  async deleteTemplate(id: string): Promise<void> {
+  deleteTemplate: withErrorHandling(async (id: string): Promise<void> => {
     await services.useCases.deleteTemplate.execute(id)
-  },
+  }),
 
-  async runSingle(input: {
+  getZoteroItems: withErrorHandling(async (): Promise<any[]> => {
+    return services.repositories.zoteroRepository.getZoteroItems()
+  }),
+
+  getZoteroCollections: withErrorHandling(async (): Promise<{ id: string; name: string }[]> => {
+    return services.repositories.zoteroRepository.getCollections()
+  }),
+
+  getZoteroItemsByCollection: withErrorHandling(async (collectionId: string): Promise<any[]> => {
+    return services.repositories.zoteroRepository.getItemsByCollection(collectionId)
+  }),
+
+  setZoteroDbPath: withErrorHandling(async (path: string): Promise<void> => {
+    services.repositories.zoteroRepository.setZoteroDbPath(path)
+  }),
+
+  getZoteroDbPath: withErrorHandling(async (): Promise<string> => {
+    return services.repositories.zoteroRepository.getZoteroDbPath()
+  }),
+
+  isZoteroAvailable: withErrorHandling(async (): Promise<boolean> => {
+    return services.repositories.zoteroRepository.isZoteroAvailable()
+  }),
+
+  runSingle: withErrorHandling(async (input: {
     file: SourceFileRef
     outputDir: string
     promptContent: string
     promptName?: string
     modelConfig: {
-      providerType: 'openai_compatible'
+      providerType: 'openai_compatible' | 'anthropic' | 'google' | 'local'
       endpoint: string
       endpointMode: 'auto' | 'manual'
       modelName: string
@@ -128,17 +169,19 @@ export const appFacade = {
     runtimeApiKey?: string
     signal?: AbortSignal
     onStageChange?: (stage: string) => void
-  }): Promise<{ outputPath: string; content: string; chunking?: ChunkingMetadata }> {
-    return services.useCases.runSingleInterpretation.execute(input)
-  },
+    enableChunking?: boolean
+  }): Promise<{ outputPath: string; content: string; chunking?: ChunkingMetadata; paperDirection?: any }> => {
+    const runSingleInterpretation = await services.container.getAsync<any>('runSingleInterpretation')
+    return runSingleInterpretation.execute(input)
+  }),
 
-  async runBatch(input: {
+  runBatch: withErrorHandling(async (input: {
     files: SourceFileRef[]
     outputDir: string
     promptContent: string
     promptName?: string
     modelConfig: {
-      providerType: 'openai_compatible'
+      providerType: 'openai_compatible' | 'anthropic' | 'google' | 'local'
       endpoint: string
       endpointMode: 'auto' | 'manual'
       modelName: string
@@ -156,7 +199,24 @@ export const appFacade = {
     onProgress?: (state: JobState) => void
     onStageChange?: (stage: string) => void
     shouldCancel?: () => boolean
-  }): Promise<JobState> {
-    return services.useCases.runBatchInterpretation.execute(input)
-  },
+    enableChunking?: boolean
+  }): Promise<JobState> => {
+    const runBatchInterpretation = await services.container.getAsync<any>('runBatchInterpretation')
+    return runBatchInterpretation.execute(input)
+  }),
+
+  getVersionInfo: withErrorHandling(async (): Promise<any> => {
+    return versionService.getVersionInfo()
+  }),
+
+  getVersionChangelog: withErrorHandling(async (): Promise<string> => {
+    return versionService.getVersionChangelog()
+  }),
+
+  isNewVersion: withErrorHandling(async (currentVersion: string): Promise<boolean> => {
+    return versionService.isNewVersion(currentVersion)
+  }),
 }
+
+// 初始化时打印版本信息
+versionService.logVersionInfo()

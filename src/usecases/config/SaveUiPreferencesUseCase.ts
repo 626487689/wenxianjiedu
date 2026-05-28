@@ -4,6 +4,7 @@ import type { AppConfig } from '../../types/config'
 export interface SaveUiPreferencesInput {
   lastInputPath?: string
   lastOutputPath?: string
+  outputFormat?: 'default' | 'obsidian'
   recursiveDefault?: boolean
   concurrency?: number
   retryCount?: number
@@ -19,6 +20,7 @@ export class SaveUiPreferencesUseCase {
       ...current,
       lastInputPath: input.lastInputPath ?? current.lastInputPath ?? '',
       lastOutputPath: input.lastOutputPath ?? current.lastOutputPath ?? '',
+      outputFormat: input.outputFormat ?? current.outputFormat,
       recursiveDefault: input.recursiveDefault ?? current.recursiveDefault,
       batch: {
         ...current.batch,

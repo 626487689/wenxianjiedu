@@ -5,7 +5,7 @@ import { normalizeOpenAIEndpoint } from '../../utils/endpoint'
 import { isNonEmpty, isValidUrl } from '../../utils/validate'
 
 export interface SaveModelConfigInput {
-  providerType: 'openai_compatible'
+  providerType: 'openai_compatible' | 'anthropic' | 'google' | 'local'
   endpoint: string
   endpointMode: 'auto' | 'manual'
   modelName: string

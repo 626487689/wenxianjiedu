@@ -8,6 +8,9 @@ import { nowIso } from '../../utils/time'
 import { buildOutputFileName } from '../../services/output/fileName'
 import { normalizeRunError } from '../../utils/runError'
 import { RunSingleInterpretationUseCase } from './RunSingleInterpretationUseCase'
+import { ConcurrencyManager, Task } from '../../utils/concurrencyManager'
+import { logger } from '../../services/logger/LoggerService'
+import { pluginManager } from '../../plugins/PluginManager'
 
 export interface RunBatchInterpretationInput {
   files: SourceFileRef[]
@@ -25,6 +28,7 @@ export interface RunBatchInterpretationInput {
   onProgress?: (state: JobState) => void
   onStageChange?: (stage: string) => void
   shouldCancel?: () => boolean
+  enableChunking?: boolean
 }
 
 export class RunBatchInterpretationUseCase {
@@ -56,9 +60,16 @@ export class RunBatchInterpretationUseCase {
 
     const concurrency = clampInteger(input.batchConfig.concurrency, 1, 6)
     const retryCount = clampInteger(input.batchConfig.retryCount, 0, 5)
-    let cursor = 0
 
     input.onProgress?.(cloneState(state))
+
+    // 初始化插件管理器
+    if (!pluginManager.isInitialized()) {
+      await pluginManager.initialize()
+    }
+
+    // 触发批处理开始前的插件事件
+    await pluginManager.emitBatchBeforeStart(input.files)
 
     const finalizePendingAsCancelled = () => {
       state.cancelled = true
@@ -73,18 +84,31 @@ export class RunBatchInterpretationUseCase {
       state.currentItemId = state.currentItemIds[0]
     }
 
-    const workers = Array.from({ length: Math.min(concurrency, state.items.length) }, async () => {
-      while (true) {
+    // 创建并发管理器
+    const concurrencyManager = new ConcurrencyManager<void>(concurrency)
+
+    // 监听取消信号
+    if (input.signal) {
+      input.signal.addEventListener('abort', () => {
+        concurrencyManager.cancel()
+        finalizePendingAsCancelled()
+        input.onProgress?.(cloneState(state))
+      })
+    }
+
+    // 为每个文件创建任务
+    const tasks: Task<void>[] = items.map((item) => ({
+      id: item.id,
+      priority: 0, // 可以根据文件大小或其他因素设置优先级
+      execute: async () => {
+        // 检查是否取消
         if (input.shouldCancel?.() || input.signal?.aborted) {
-          finalizePendingAsCancelled()
-          input.onProgress?.(cloneState(state))
-          return
-        }
-
-        const item = state.items[cursor]
-        cursor += 1
-
-        if (!item) {
+          item.status = 'cancelled'
+          item.finishedAt = nowIso()
+          item.errorCode = 'CANCELLED'
+          item.errorMessage = '任务已取消'
+          state.cancelled = true
+          state.cancelledCount += 1
           return
         }
 
@@ -97,19 +121,13 @@ export class RunBatchInterpretationUseCase {
           item.attempts = 0
           state.completed += 1
           state.skippedCount += 1
-          input.onProgress?.(cloneState(state))
-          continue
+          return
         }
-
-        item.status = 'running'
-        item.startedAt = item.startedAt ?? nowIso()
-        state.currentItemIds = [...state.currentItemIds, item.id]
-        updateCurrentItems()
-        input.onProgress?.(cloneState(state))
 
         for (let attempt = 1; attempt <= retryCount + 1; attempt += 1) {
           item.attempts = attempt
 
+          // 检查是否取消
           if (input.shouldCancel?.() || input.signal?.aborted) {
             item.status = 'cancelled'
             item.finishedAt = nowIso()
@@ -117,11 +135,7 @@ export class RunBatchInterpretationUseCase {
             item.errorMessage = '任务已取消'
             state.cancelled = true
             state.cancelledCount += 1
-            state.currentItemIds = state.currentItemIds.filter((id) => id !== item.id)
-            updateCurrentItems()
-            finalizePendingAsCancelled()
-            input.onProgress?.(cloneState(state))
-            break
+            return
           }
 
           try {
@@ -134,6 +148,7 @@ export class RunBatchInterpretationUseCase {
               runtimeApiKey: input.runtimeApiKey,
               signal: input.signal,
               onStageChange: (stage) => input.onStageChange?.(`${item.file.name}：${stage}`),
+              enableChunking: input.enableChunking,
             })
 
             item.status = 'success'
@@ -154,8 +169,7 @@ export class RunBatchInterpretationUseCase {
               item.errorMessage = normalized.message
               state.cancelled = true
               state.cancelledCount += 1
-              finalizePendingAsCancelled()
-              break
+              return
             }
 
             item.errorCode = normalized.code
@@ -163,7 +177,6 @@ export class RunBatchInterpretationUseCase {
             if (attempt <= retryCount) {
               item.errorMessage = `第 ${attempt} 次尝试失败：${normalized.message}`
               input.onStageChange?.(`${item.file.name}：处理失败，准备进行第 ${attempt + 1} 次尝试`)
-              input.onProgress?.(cloneState(state))
               continue
             }
 
@@ -174,14 +187,42 @@ export class RunBatchInterpretationUseCase {
             break
           }
         }
-
+      },
+      onStart: () => {
+        item.status = 'running'
+        item.startedAt = item.startedAt ?? nowIso()
+        state.currentItemIds = [...state.currentItemIds, item.id]
+        updateCurrentItems()
+        input.onProgress?.(cloneState(state))
+      },
+      onComplete: () => {
+        state.currentItemIds = state.currentItemIds.filter((id) => id !== item.id)
+        updateCurrentItems()
+        input.onProgress?.(cloneState(state))
+      },
+      onError: (error) => {
+        logger.error(`任务 ${item.id} 执行失败: ${error}`)
         state.currentItemIds = state.currentItemIds.filter((id) => id !== item.id)
         updateCurrentItems()
         input.onProgress?.(cloneState(state))
       }
-    })
+    }))
 
-    await Promise.all(workers)
+    // 添加所有任务到并发管理器
+    tasks.forEach(task => concurrencyManager.addTask(task))
+
+    // 等待所有任务完成
+    await new Promise<void>((resolve) => {
+      const checkComplete = () => {
+        const status = concurrencyManager.getStatus()
+        if (status.running === 0 && status.queueLength === 0) {
+          resolve()
+        } else {
+          setTimeout(checkComplete, 100)
+        }
+      }
+      checkComplete()
+    })
 
     if (state.mode === 'batch') {
       try {
@@ -194,6 +235,10 @@ export class RunBatchInterpretationUseCase {
     state.currentItemIds = []
     state.currentItemId = undefined
     input.onProgress?.(cloneState(state))
+
+    // 触发批处理完成后的插件事件
+    await pluginManager.emitBatchAfterComplete(cloneState(state))
+
     return cloneState(state)
   }
 

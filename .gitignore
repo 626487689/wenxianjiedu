@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime outputs
+outputs/
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+
+# Test coverage
+coverage/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Lock files (optional - some projects commit these)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Temporary app directory (if exists)
+temp-app/
+
+# Tauri bundle outputs (optional - these are large binaries)
+# bundle/

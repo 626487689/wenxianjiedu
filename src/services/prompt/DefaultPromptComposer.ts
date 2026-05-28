@@ -1,13 +1,13 @@
 import type { PromptComposer } from './PromptComposer'
 import type { ComposePromptInput, ComposedPrompt } from '../../types/prompt'
 
-const MAX_DOCUMENT_CHARS = 60000
+const MAX_DOCUMENT_CHARS = 15000
 const DOCUMENT_TRUNCATION_NOTICE = '\n\n[内容过长，已为模型调用自动截断。当前已优先保留前部完整段落，并在容量边界处截取剩余正文；如需完整分析，请分段处理原文。]'
 
 export class DefaultPromptComposer implements PromptComposer {
   compose(input: ComposePromptInput): ComposedPrompt {
-    const { promptContent, document } = input
-    const prepared = buildPromptDocumentText(document.text)
+    const { promptContent, document, skipTruncation } = input
+    const prepared = buildPromptDocumentText(document.text, skipTruncation)
 
     const userPrompt = [
       '你将阅读一篇文献或文本材料。请严格按照以下要求进行解读：',
@@ -37,7 +37,7 @@ export class DefaultPromptComposer implements PromptComposer {
   }
 }
 
-function buildPromptDocumentText(text: string): {
+function buildPromptDocumentText(text: string, skipTruncation?: boolean): {
   text: string
   truncated: boolean
   originalLength: number
@@ -46,7 +46,7 @@ function buildPromptDocumentText(text: string): {
   const normalized = text.trim()
   const originalLength = normalized.length
 
-  if (originalLength <= MAX_DOCUMENT_CHARS) {
+  if (skipTruncation || originalLength <= MAX_DOCUMENT_CHARS) {
     return {
       text: normalized,
       truncated: false,

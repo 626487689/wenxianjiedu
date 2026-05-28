@@ -12,6 +12,7 @@ export interface MarkdownOutputInput {
   usage?: ModelUsage
   chunking?: ChunkingMetadata
   chunkSummaries?: string[]
+  paperDirection?: any
   truncation?: {
     applied: boolean
     originalLength: number

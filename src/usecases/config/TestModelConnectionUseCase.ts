@@ -1,6 +1,6 @@
 import type { CredentialRepository } from '../../repositories/credential/CredentialRepository'
 import type { ModelConfig } from '../../types/config'
-import type { LLMClient } from '../../services/llm/LLMClient'
+import { ModelClientFactory } from '../../services/llm/ModelClientFactory'
 import { normalizeOpenAIEndpoint } from '../../utils/endpoint'
 import { isNonEmpty, isValidUrl } from '../../utils/validate'
 
@@ -19,7 +19,7 @@ const TEST_PROMPT = '请只回复“连接成功”。'
 export class TestModelConnectionUseCase {
   constructor(
     private readonly credentialRepository: CredentialRepository,
-    private readonly llmClient: LLMClient,
+    private readonly modelClientFactory: typeof ModelClientFactory,
   ) {}
 
   async execute(input: TestModelConnectionInput): Promise<TestModelConnectionResult> {
@@ -53,7 +53,8 @@ export class TestModelConnectionUseCase {
       throw new Error('未找到可用的 API Key')
     }
 
-    const result = await this.llmClient.generate({
+    const llmClient = this.modelClientFactory.createClient(input.modelConfig.providerType)
+    const result = await llmClient.generate({
       endpoint: normalizedEndpoint,
       endpointMode: input.modelConfig.endpointMode,
       modelName,

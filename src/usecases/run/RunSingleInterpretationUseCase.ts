@@ -7,9 +7,17 @@ import type { ChunkingMetadata } from '../../types/prompt'
 import type { DocumentParser } from '../../services/parser/DocumentParser'
 import type { PromptComposer } from '../../services/prompt/PromptComposer'
 import type { LLMClient } from '../../services/llm/LLMClient'
+import { ModelClientFactory } from '../../services/llm/ModelClientFactory'
+import { SmartChunkingService } from '../../services/chunking/SmartChunkingService'
+import { chunkCacheService } from '../../services/chunking/ChunkCacheService'
+import { PaperAnalyzer } from '../../services/analyzer/PaperAnalyzer'
 import type { MarkdownWriter } from '../../services/output/MarkdownWriter'
+import { performanceMonitor } from '../../services/monitoring/PerformanceMonitorService'
+import { errorHandler } from '../../services/error/ErrorHandlerService'
 import { isNonEmpty, isValidUrl } from '../../utils/validate'
 import { normalizeOpenAIEndpoint } from '../../utils/endpoint'
+import { globalThrottler } from '../../utils/requestThrottler'
+import { pluginManager } from '../../plugins/PluginManager'
 
 const CHUNK_MAX_CHARS = 20000
 const CHUNK_SUMMARY_MAX_CHARS = 12000
@@ -23,6 +31,7 @@ export interface RunSingleInterpretationInput {
   runtimeApiKey?: string
   signal?: AbortSignal
   onStageChange?: (stage: string) => void
+  enableChunking?: boolean
 }
 
 export interface RunSingleInterpretationResult {
@@ -32,13 +41,19 @@ export interface RunSingleInterpretationResult {
 }
 
 export class RunSingleInterpretationUseCase {
+  private readonly smartChunkingService: SmartChunkingService
+  private readonly paperAnalyzer: PaperAnalyzer
+
   constructor(
     private readonly credentialRepository: CredentialRepository,
     private readonly documentParser: DocumentParser,
     private readonly promptComposer: PromptComposer,
-    private readonly llmClient: LLMClient,
+    private readonly modelClientFactory: typeof ModelClientFactory,
     private readonly markdownWriter: MarkdownWriter,
-  ) {}
+  ) {
+    this.smartChunkingService = new SmartChunkingService()
+    this.paperAnalyzer = new PaperAnalyzer()
+  }
 
   async execute(input: RunSingleInterpretationInput): Promise<RunSingleInterpretationResult> {
     input.onStageChange?.('正在校验任务参数')
@@ -60,6 +75,11 @@ export class RunSingleInterpretationUseCase {
       throw new Error('模型名称不能为空')
     }
 
+    // 初始化插件管理器
+    if (!pluginManager.isInitialized()) {
+      await pluginManager.initialize()
+    }
+
     input.onStageChange?.('正在读取 API Key')
     const runtimeApiKey = input.runtimeApiKey?.trim() ?? ''
     const savedApiKey = runtimeApiKey ? '' : (await this.credentialRepository.loadApiKey())?.trim() ?? ''
@@ -72,9 +92,18 @@ export class RunSingleInterpretationUseCase {
     input.onStageChange?.(`正在解析文档：${input.file.name}`)
     let document: ParsedDocument
     try {
+      // 触发文档解析前的插件事件
+      await pluginManager.emitDocumentBeforeParse(input.file)
+
+      const parseId = performanceMonitor.start('document_parse', 'parser', { filename: input.file.name })
       document = await this.documentParser.parse(input.file)
+      performanceMonitor.end(parseId)
+
+      // 触发文档解析后的插件事件
+      document.text = await pluginManager.emitDocumentAfterParse(input.file, document.text)
     } catch (error) {
-      throw new Error(`文档解析失败: ${normalizeErrorMessage(error)}`)
+      const errorInfo = errorHandler.handleError(error)
+      throw new Error(`文档解析失败: ${errorInfo.message}\n${errorInfo.details}\n建议: ${errorInfo.suggestion}`)
     }
 
     const runResult = await this.generateInterpretation({
@@ -84,6 +113,7 @@ export class RunSingleInterpretationUseCase {
       apiKey,
       signal: input.signal,
       onStageChange: input.onStageChange,
+      enableChunking: input.enableChunking,
     })
 
     input.onStageChange?.('正在写入结果文件')
@@ -98,6 +128,7 @@ export class RunSingleInterpretationUseCase {
         usage: runResult.usage,
         chunking: runResult.chunking,
         chunkSummaries: runResult.chunkSummaries,
+        paperDirection: runResult.paperDirection,
         truncation: runResult.truncation,
       })
 
@@ -107,7 +138,8 @@ export class RunSingleInterpretationUseCase {
         chunking: runResult.chunking,
       }
     } catch (error) {
-      throw new Error(`结果写入失败: ${normalizeErrorMessage(error)}`)
+      const errorInfo = errorHandler.handleError(error)
+      throw new Error(`结果写入失败: ${errorInfo.message}\n${errorInfo.details}\n建议: ${errorInfo.suggestion}`)
     }
   }
 
@@ -118,11 +150,13 @@ export class RunSingleInterpretationUseCase {
     apiKey: string
     signal?: AbortSignal
     onStageChange?: (stage: string) => void
+    enableChunking?: boolean
   }): Promise<{
     content: string
     usage?: ModelUsage
     chunking?: ChunkingMetadata
     chunkSummaries?: string[]
+    paperDirection?: any
     truncation: {
       applied: boolean
       originalLength: number
@@ -130,7 +164,53 @@ export class RunSingleInterpretationUseCase {
     }
   }> {
     const normalizedText = input.document.text.trim()
-    const chunks = splitDocumentIntoChunks(normalizedText, CHUNK_MAX_CHARS)
+    const maxTokens = input.modelConfig.maxTokens || this.smartChunkingService.getDefaultMaxTokens(input.modelConfig.modelName)
+    
+    // 分析论文方向
+    let paperDirection = undefined
+    try {
+      input.onStageChange?.('正在分析论文研究方向')
+      const analyzeId = performanceMonitor.start('paper_direction_analysis', 'analyzer', { model: input.modelConfig.modelName })
+      paperDirection = await this.paperAnalyzer.analyzePaperDirection(normalizedText, input.modelConfig, input.apiKey)
+      performanceMonitor.end(analyzeId)
+    } catch (error) {
+      // 方向分析失败不影响主要功能
+      console.warn('论文方向分析失败:', error)
+    }
+
+    // 检查是否启用分块处理
+    if (!input.enableChunking) {
+      input.onStageChange?.('正在组装提示词（不分块模式）')
+      const composed = this.promptComposer.compose({
+        promptContent: input.promptContent,
+        document: input.document,
+      })
+
+      input.onStageChange?.('正在调用模型')
+      const modelResult = await this.callModel({
+        modelConfig: input.modelConfig,
+        apiKey: input.apiKey,
+        prompt: composed.userPrompt,
+        signal: input.signal,
+      })
+
+      return {
+        content: modelResult.content,
+        usage: modelResult.usage,
+        chunking: {
+          enabled: false,
+          originalLength: normalizedText.length,
+          finalLength: composed.truncation.finalLength,
+        },
+        chunkSummaries: undefined,
+        paperDirection,
+        truncation: composed.truncation,
+      }
+    }
+
+    // 启用分块处理
+    const chunkResults = this.smartChunkingService.chunkByMaxTokens(normalizedText, maxTokens)
+    const chunks = chunkResults.map(chunk => chunk.text)
 
     if (chunks.length <= 1) {
       input.onStageChange?.('正在组装提示词')
@@ -156,131 +236,129 @@ export class RunSingleInterpretationUseCase {
           finalLength: composed.truncation.finalLength,
         },
         chunkSummaries: undefined,
+        paperDirection,
         truncation: composed.truncation,
       }
     }
 
-    input.onStageChange?.(`检测到长文，准备分块处理（共 ${chunks.length} 段）`)
+    input.onStageChange?.(`检测到长文，准备分块处理（共 ${chunks.length} 段，每段最大 ${maxTokens} tokens）`)
 
     const chunkSummaries: string[] = []
     const chunkAppendixEntries: string[] = []
     let usage: ModelUsage = createEmptyUsage()
 
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunkText = chunks[index]
-      input.onStageChange?.(`正在解读分块 ${index + 1}/${chunks.length}`)
-
-      const chunkDocument: ParsedDocument = {
-        ...input.document,
-        text: chunkText,
+    // 并行处理分块，每次处理2个分块（根据API限制调整）
+    const batchSize = 2
+    for (let batchStart = 0; batchStart < chunks.length; batchStart += batchSize) {
+      // 检查是否取消
+      if (input.signal?.aborted) {
+        throw new Error('任务已取消')
       }
+      
+      const batchEnd = Math.min(batchStart + batchSize, chunks.length)
+      const batchChunks = chunks.slice(batchStart, batchEnd)
+      
+      const batchResults = await Promise.all(
+        batchChunks.map(async (chunkText, batchIndex) => {
+          // 检查是否取消
+          if (input.signal?.aborted) {
+            throw new Error('任务已取消')
+          }
+          
+          const actualIndex = batchStart + batchIndex
+          const chunkTokenCount = this.smartChunkingService.calculateTotalTokens(chunkText)
+          
+          // 检查分块是否在缓存中
+          const cachedResult = chunkCacheService.get(chunkText, input.modelConfig.modelName)
+          if (cachedResult) {
+            input.onStageChange?.(`从缓存中获取分块 ${actualIndex + 1}/${chunks.length} 的结果`)
+            return {
+              summary: trimChunkSummary(cachedResult, actualIndex + 1),
+              fullContent: cachedResult,
+              usage: undefined
+            }
+          }
 
-      const composed = this.promptComposer.compose({
-        promptContent: buildChunkPrompt(input.promptContent, index + 1, chunks.length),
-        document: chunkDocument,
+          input.onStageChange?.(`正在解读分块 ${actualIndex + 1}/${chunks.length}（${chunkTokenCount} tokens）`)
+
+          const chunkDocument: ParsedDocument = {
+            ...input.document,
+            text: chunkText,
+          }
+
+          const composed = this.promptComposer.compose({
+            promptContent: buildChunkPrompt(input.promptContent, actualIndex + 1, chunks.length),
+            document: chunkDocument,
+            skipTruncation: true,
+          })
+
+          const modelResult = await this.callModel({
+            modelConfig: input.modelConfig,
+            apiKey: input.apiKey,
+            prompt: composed.userPrompt,
+            signal: input.signal,
+          })
+
+          // 将分块结果存入缓存
+          chunkCacheService.set(chunkText, input.modelConfig.modelName, modelResult.content.trim(), chunkTokenCount)
+
+          return {
+            summary: trimChunkSummary(modelResult.content, actualIndex + 1),
+            fullContent: modelResult.content.trim(),
+            usage: modelResult.usage
+          }
+        })
+      )
+
+      // 处理批处理结果
+      batchResults.forEach((result) => {
+        chunkSummaries.push(result.summary)
+        chunkAppendixEntries.push(result.fullContent)
+        if (result.usage) {
+          usage = mergeUsage(usage, result.usage)
+        }
       })
-
-      const modelResult = await this.callModel({
-        modelConfig: input.modelConfig,
-        apiKey: input.apiKey,
-        prompt: composed.userPrompt,
-        signal: input.signal,
-      })
-
-      usage = mergeUsage(usage, modelResult.usage)
-      const chunkSummary = trimChunkSummary(modelResult.content, index + 1)
-      chunkSummaries.push(chunkSummary)
-      chunkAppendixEntries.push(modelResult.content.trim())
     }
 
+    // 检查是否取消
+    if (input.signal?.aborted) {
+      throw new Error('任务已取消')
+    }
+    
     input.onStageChange?.('正在汇总分块结果')
-    const summaryBundle = chunkSummaries.join('\n\n')
-    const finalPrompt = buildFinalSummaryPrompt(input.promptContent, input.document, summaryBundle)
+    
+    // 使用滚动汇总方式，避免单次请求token数过多
+    const finalContent = await this.performRollupSummary(
+      chunkSummaries,
+      input.promptContent,
+      input.document,
+      input.modelConfig,
+      input.apiKey,
+      input.signal,
+      input.onStageChange
+    )
+    
+    usage = mergeUsage(usage, finalContent.usage)
 
-    try {
-      const finalResult = await this.callModel({
-        modelConfig: input.modelConfig,
-        apiKey: input.apiKey,
-        prompt: finalPrompt,
-        signal: input.signal,
-      })
-
-      usage = mergeUsage(usage, finalResult.usage)
-
-      return {
-        content: finalResult.content,
-        usage,
-        chunking: {
-          enabled: true,
-          chunkCount: chunks.length,
-          originalLength: normalizedText.length,
-          finalLength: summaryBundle.length,
-          degraded: false,
-        },
-        chunkSummaries: chunkAppendixEntries,
-        truncation: {
-          applied: false,
-          originalLength: normalizedText.length,
-          finalLength: normalizedText.length,
-        },
-      }
-    } catch (error) {
-      const firstError = normalizeErrorMessage(error)
-      input.onStageChange?.('长文汇总首次失败，正在缩减上下文后重试')
-
-      const retrySummaryBundle = shrinkSummaryBundle(chunkSummaries)
-      const retryPrompt = buildFinalSummaryPrompt(input.promptContent, input.document, retrySummaryBundle)
-
-      try {
-        const retryResult = await this.callModel({
-          modelConfig: input.modelConfig,
-          apiKey: input.apiKey,
-          prompt: retryPrompt,
-          signal: input.signal,
-        })
-
-        usage = mergeUsage(usage, retryResult.usage)
-
-        return {
-          content: retryResult.content,
-          usage,
-          chunking: {
-            enabled: true,
-            chunkCount: chunks.length,
-            originalLength: normalizedText.length,
-            finalLength: retrySummaryBundle.length,
-            degraded: false,
-          },
-          chunkSummaries: chunkAppendixEntries,
-          truncation: {
-            applied: false,
-            originalLength: normalizedText.length,
-            finalLength: normalizedText.length,
-          },
-        }
-      } catch (retryError) {
-        const degradeReason = `首次汇总失败：${firstError}；缩减后重试失败：${normalizeErrorMessage(retryError)}`
-        input.onStageChange?.('长文汇总失败，正在降级输出分块摘要')
-
-        return {
-          content: buildDegradedContent(chunkAppendixEntries, degradeReason),
-          usage,
-          chunking: {
-            enabled: true,
-            chunkCount: chunks.length,
-            originalLength: normalizedText.length,
-            finalLength: retrySummaryBundle.length,
-            degraded: true,
-            degradeReason,
-          },
-          chunkSummaries: chunkAppendixEntries,
-          truncation: {
-            applied: false,
-            originalLength: normalizedText.length,
-            finalLength: normalizedText.length,
-          },
-        }
-      }
+    return {
+      content: finalContent.content,
+      usage,
+      chunking: {
+        enabled: true,
+        chunkCount: chunks.length,
+        originalLength: normalizedText.length,
+        finalLength: finalContent.content.length,
+        maxTokens,
+        degraded: finalContent.degraded,
+        degradeReason: finalContent.degradeReason,
+      },
+      chunkSummaries: chunkAppendixEntries,
+      paperDirection,
+      truncation: {
+        applied: false,
+        originalLength: normalizedText.length,
+        finalLength: normalizedText.length,
+      },
     }
   }
 
@@ -291,19 +369,152 @@ export class RunSingleInterpretationUseCase {
     signal?: AbortSignal
   }) {
     try {
-      return await this.llmClient.generate({
+      const callId = performanceMonitor.start('model_call', 'llm', {
+        model: input.modelConfig.modelName,
+        provider: input.modelConfig.providerType,
+        promptLength: input.prompt.length
+      })
+      
+      // 使用节流器限制API调用频率
+      await globalThrottler.throttle()
+      
+      // 触发模型调用前的插件事件
+      const processedPrompt = await pluginManager.emitModelBeforeCall(input.prompt, input.modelConfig)
+      
+      const llmClient = this.modelClientFactory.createClient(input.modelConfig.providerType)
+      const result = await llmClient.generate({
         endpoint: normalizeOpenAIEndpoint(input.modelConfig.endpoint, input.modelConfig.endpointMode),
         endpointMode: input.modelConfig.endpointMode,
         modelName: input.modelConfig.modelName,
         apiKey: input.apiKey,
-        prompt: input.prompt,
+        prompt: processedPrompt,
         timeoutMs: input.modelConfig.timeoutMs,
         temperature: input.modelConfig.temperature,
         maxTokens: input.modelConfig.maxTokens,
         signal: input.signal,
       })
+      
+      // 触发模型调用后的插件事件
+      result.content = await pluginManager.emitModelAfterCall(result.content, input.modelConfig)
+      
+      performanceMonitor.end(callId)
+      return result
     } catch (error) {
-      throw new Error(`模型调用失败: ${normalizeErrorMessage(error)}`)
+      const errorInfo = errorHandler.handleError(error)
+      throw new Error(`模型调用失败: ${errorInfo.message}\n${errorInfo.details}\n建议: ${errorInfo.suggestion}`)
+    }
+  }
+
+  private async performRollupSummary(
+    chunkSummaries: string[],
+    promptContent: string,
+    document: ParsedDocument,
+    modelConfig: ModelConfig,
+    apiKey: string,
+    signal?: AbortSignal,
+    onStageChange?: (stage: string) => void
+  ): Promise<{
+    content: string
+    usage?: ModelUsage
+    degraded: boolean
+    degradeReason?: string
+  }> {
+    const MAX_ROLLUP_CHUNKS = 5
+    const totalChunks = chunkSummaries.length
+    
+    // 如果分块数量不多，可以直接一次性汇总
+    if (totalChunks <= MAX_ROLLUP_CHUNKS) {
+      const summaryBundle = chunkSummaries.join('\n\n')
+      const finalPrompt = buildFinalSummaryPrompt(promptContent, document, summaryBundle)
+      
+      try {
+        const finalResult = await this.callModel({
+          modelConfig,
+          apiKey,
+          prompt: finalPrompt,
+          signal,
+        })
+        return {
+          content: finalResult.content,
+          usage: finalResult.usage,
+          degraded: false,
+        }
+      } catch (error) {
+        return {
+          content: buildDegradedContent(chunkSummaries, normalizeErrorMessage(error)),
+          degraded: true,
+          degradeReason: normalizeErrorMessage(error),
+        }
+      }
+    }
+    
+    // 使用滚动汇总策略
+    onStageChange?.(`使用滚动汇总策略（共 ${totalChunks} 个分块）`)
+    
+    let currentSummary = ''
+    let accumulatedUsage: ModelUsage = createEmptyUsage()
+    let degradeReason: string | undefined
+    
+    for (let i = 0; i < totalChunks; i += MAX_ROLLUP_CHUNKS) {
+      // 检查是否取消
+      if (signal?.aborted) {
+        throw new Error('任务已取消')
+      }
+      
+      const endIndex = Math.min(i + MAX_ROLLUP_CHUNKS, totalChunks)
+      const batch = chunkSummaries.slice(i, endIndex)
+      
+      onStageChange?.(`汇总分块 ${i + 1}-${endIndex}/${totalChunks}`)
+      
+      // 构建滚动汇总提示词
+      let rollupPrompt: string
+      if (i === 0) {
+        // 第一轮：直接汇总前几个分块
+        const batchBundle = batch.join('\n\n')
+        rollupPrompt = buildRollupPrompt(promptContent, document, batchBundle, 1, Math.ceil(totalChunks / MAX_ROLLUP_CHUNKS))
+      } else {
+        // 后续轮次：将之前的汇总结果与新分块合并
+        const batchBundle = batch.join('\n\n')
+        rollupPrompt = buildRollupPrompt(
+          promptContent, 
+          document, 
+          batchBundle, 
+          Math.floor(i / MAX_ROLLUP_CHUNKS) + 1, 
+          Math.ceil(totalChunks / MAX_ROLLUP_CHUNKS),
+          currentSummary
+        )
+      }
+      
+      try {
+        const result = await this.callModel({
+          modelConfig,
+          apiKey,
+          prompt: rollupPrompt,
+          signal,
+        })
+        
+        currentSummary = result.content
+        accumulatedUsage = mergeUsage(accumulatedUsage, result.usage)
+        
+      } catch (error) {
+        const errorMsg = normalizeErrorMessage(error)
+        degradeReason = `汇总分块 ${i + 1}-${endIndex} 时失败: ${errorMsg}`
+        onStageChange?.(degradeReason)
+        
+        // 返回降级内容
+        return {
+          content: buildDegradedContent(chunkSummaries, degradeReason),
+          usage: accumulatedUsage,
+          degraded: true,
+          degradeReason,
+        }
+      }
+    }
+    
+    return {
+      content: currentSummary,
+      usage: accumulatedUsage,
+      degraded: false,
     }
   }
 }
@@ -532,6 +743,46 @@ function shrinkSummaryBundle(chunkSummaries: string[]): string {
       return `### 分块 ${index + 1}\n${shortened}`
     })
     .join('\n\n')
+}
+
+function buildRollupPrompt(
+  promptContent: string,
+  document: ParsedDocument,
+  summaryBundle: string,
+  currentRound: number,
+  totalRounds: number,
+  previousSummary?: string
+): string {
+  const parts = [
+    '你将收到一篇长文献分块解读后的阶段性结果，请综合它们输出汇总解读。',
+    '',
+    promptContent,
+    '',
+    '补充要求：',
+    '- 需要合并重复信息，消除前后冲突',
+    '- 如果不同分块信息不一致，请明确指出',
+    '- 输出时按逻辑组织，保持连贯性',
+    '',
+    `文件名：${document.name}`,
+    `文件类型：${document.kind}`,
+    `汇总阶段：第 ${currentRound}/${totalRounds} 轮`,
+  ]
+  
+  if (previousSummary && currentRound > 1) {
+    parts.push(
+      '',
+      '以下是前一轮的汇总结果（请与本轮新内容合并）：',
+      previousSummary,
+    )
+  }
+  
+  parts.push(
+    '',
+    '以下是本轮待汇总的分块阶段性解读：',
+    summaryBundle,
+  )
+  
+  return parts.join('\n')
 }
 
 function createEmptyUsage(): ModelUsage {

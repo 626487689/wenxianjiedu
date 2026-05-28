@@ -16,6 +16,7 @@ export class DefaultMarkdownWriter implements MarkdownWriter {
       : ''
     const usageLines = formatUsage(input)
     const chunkingLines = formatChunking(input)
+    const paperDirectionLines = formatPaperDirection(input)
     const appendixLines = formatChunkAppendix(input)
 
     const content = [
@@ -31,6 +32,7 @@ export class DefaultMarkdownWriter implements MarkdownWriter {
       `- 处理时间：${input.generatedAt}`,
       `- 是否截断正文：${truncationStatus}${truncationDetail}`,
       ...chunkingLines,
+      ...paperDirectionLines,
       ...usageLines,
       '',
       '## 解读内容',
@@ -97,4 +99,20 @@ function formatChunkAppendix(input: MarkdownOutputInput): string[] {
       '',
     ]),
   ]
+}
+
+function formatPaperDirection(input: MarkdownOutputInput): string[] {
+  if (!input.paperDirection) {
+    return []
+  }
+
+  const lines = [
+    '- 研究方向分析：',
+    `  - 主要方向: ${input.paperDirection.mainDirection}`,
+    `  - 子方向: ${input.paperDirection.subDirections?.join(', ') ?? '无'}`,
+    `  - 核心关键词: ${input.paperDirection.keywords?.join(', ') ?? '无'}`,
+    `  - 置信度: ${input.paperDirection.confidence ?? '未知'}`,
+  ]
+
+  return lines
 }

@@ -12,6 +12,7 @@ export interface PromptTemplate {
 export interface ComposePromptInput {
   promptContent: string
   document: ParsedDocument
+  skipTruncation?: boolean
 }
 
 export interface ChunkingMetadata {
@@ -19,6 +20,7 @@ export interface ChunkingMetadata {
   chunkCount?: number
   originalLength: number
   finalLength: number
+  maxTokens?: number
   degraded?: boolean
   degradeReason?: string
 }

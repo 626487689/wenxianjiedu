@@ -8,8 +8,8 @@ export interface LoadInputFilesInput {
   recursive: boolean
 }
 
-function inferExt(path: string): 'pdf' | 'md' | 'txt' | null {
-  const lower = path.toLowerCase()
+function inferExt(pathOrName: string): 'pdf' | 'md' | 'txt' | null {
+  const lower = pathOrName.toLowerCase()
   if (lower.endsWith('.pdf')) return 'pdf'
   if (lower.endsWith('.md')) return 'md'
   if (lower.endsWith('.txt')) return 'txt'
@@ -31,6 +31,18 @@ export class LoadInputFilesUseCase {
     }
 
     if (input.sourceType === 'file') {
+      if (input.sourcePath.startsWith('browser-file-')) {
+        const fileId = input.sourcePath
+        return [
+          {
+            id: fileId,
+            path: fileId,
+            name: `selected-file-${fileId.slice(-8)}`,
+            ext: 'pdf',
+          },
+        ]
+      }
+      
       const ext = inferExt(input.sourcePath)
       if (!ext) {
         return []

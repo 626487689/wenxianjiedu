@@ -9,7 +9,10 @@ import { OutputPanel } from '../components/OutputPanel'
 import { PromptEditorPanel } from '../components/PromptEditorPanel'
 import { TaskPanel } from '../components/TaskPanel'
 import { ResultPanel } from '../components/ResultPanel'
+import { ZoteroPanel } from '../components/ZoteroPanel'
 import { appFacade } from '../../app/appFacade'
+import { logger } from '../../services/logger/LoggerService'
+import { attachmentSupportService } from '../../services/api/AttachmentSupportService'
 
 export function MainPage() {
   const cancelRequestedRef = useRef(false)
@@ -21,7 +24,7 @@ export function MainPage() {
   const [modelName, setModelName] = useState('')
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [apiKeySaved, setApiKeySaved] = useState(false)
-  const [timeoutMs, setTimeoutMs] = useState(60000)
+  const [timeoutMs, setTimeoutMs] = useState(300000)
   const [rememberApiKey, setRememberApiKey] = useState(true)
 
   const [sourceType, setSourceType] = useState<'file' | 'folder' | null>(null)
@@ -30,6 +33,8 @@ export function MainPage() {
   const [files, setFiles] = useState<SourceFileRef[]>([])
 
   const [outputDir, setOutputDir] = useState('')
+  const [outputFormat, setOutputFormat] = useState<'default' | 'obsidian'>('default')
+  const [showZoteroPanel, setShowZoteroPanel] = useState(false)
 
   const [templates, setTemplates] = useState<PromptTemplate[]>([])
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | undefined>()
@@ -39,6 +44,7 @@ export function MainPage() {
   const [concurrency, setConcurrency] = useState(1)
   const [retryCount, setRetryCount] = useState(0)
   const [skipExistingOutput, setSkipExistingOutput] = useState(false)
+  const [enableChunking, setEnableChunking] = useState(false)
 
   const [jobState, setJobState] = useState<JobState | null>(null)
   const [isRunning, setIsRunning] = useState(false)
@@ -48,11 +54,20 @@ export function MainPage() {
   const [latestOutputContent, setLatestOutputContent] = useState<string | undefined>()
   const [latestError, setLatestError] = useState<string | undefined>()
   const [latestChunking, setLatestChunking] = useState<ChunkingMetadata | undefined>()
+  const [latestPaperDirection, setLatestPaperDirection] = useState<any | undefined>()
   const [currentStage, setCurrentStage] = useState<string | undefined>()
+  const [logs, setLogs] = useState<string[]>([])
+  const [progress, setProgress] = useState(0)
 
   const [loadingConfig, setLoadingConfig] = useState(true)
   const [savingConfig, setSavingConfig] = useState(false)
   const [testingConnection, setTestingConnection] = useState(false)
+  const [attachmentTesting, setAttachmentTesting] = useState(false)
+  const [attachmentResult, setAttachmentResult] = useState<{
+    supportsAttachments: boolean
+    attachmentType?: string
+    message?: string
+  } | null>(null)
   const [loadingFiles, setLoadingFiles] = useState(false)
   const [savingTemplate, setSavingTemplate] = useState(false)
   const [deletingTemplate, setDeletingTemplate] = useState(false)
@@ -60,10 +75,32 @@ export function MainPage() {
   useEffect(() => {
     let active = true
 
+    // 添加日志处理程序
+    const logHandler = (entry: any) => {
+      if (active) {
+        // 格式化日志条目
+        const formattedMessage = typeof entry === 'string' 
+          ? entry 
+          : `[${entry.timestamp}] ${entry.level.toUpperCase()}: ${entry.category ? `[${entry.category}] ` : ''}${entry.message}${entry.metadata ? ` ${JSON.stringify(entry.metadata)}` : ''}`;
+        
+        setLogs(prev => {
+          const newLogs = [...prev, formattedMessage]
+          // 只保留最近的100条日志
+          if (newLogs.length > 100) {
+            return newLogs.slice(-100)
+          }
+          return newLogs
+        })
+      }
+    }
+
+    logger.addLogHandler(logHandler)
+
     async function bootstrap() {
       try {
         setLoadingConfig(true)
         setLatestError(undefined)
+        logger.info('开始初始化应用')
 
         const initial = await appFacade.loadInitialData()
         if (!active) return
@@ -76,13 +113,17 @@ export function MainPage() {
         setApiKeySaved(initial.apiKeySaved)
         setRecursive(initial.config.recursiveDefault)
         setOutputDir(initial.config.lastOutputPath ?? '')
+        setOutputFormat(initial.config.outputFormat ?? 'default')
         setConcurrency(initial.config.batch.concurrency)
         setRetryCount(initial.config.batch.retryCount)
         setSkipExistingOutput(initial.config.batch.skipExistingOutput)
         setTemplates(initial.templates)
+        logger.info('应用初始化完成')
       } catch (error) {
         if (!active) return
-        setLatestError(getErrorMessage(error, '初始化失败'))
+        const errorMessage = getErrorMessage(error, '初始化失败')
+        setLatestError(errorMessage)
+        logger.error(errorMessage)
       } finally {
         if (!active) return
         setLoadingConfig(false)
@@ -93,6 +134,7 @@ export function MainPage() {
 
     return () => {
       active = false
+      logger.removeLogHandler(logHandler)
     }
   }, [])
 
@@ -125,6 +167,7 @@ export function MainPage() {
   async function persistUiPreferences(input: {
     lastInputPath?: string
     lastOutputPath?: string
+    outputFormat?: 'default' | 'obsidian'
     recursiveDefault?: boolean
     concurrency?: number
     retryCount?: number
@@ -194,6 +237,33 @@ export function MainPage() {
       setLatestError(getErrorMessage(error, '测试连接失败'))
     } finally {
       setTestingConnection(false)
+    }
+  }
+
+  async function handleTestAttachment() {
+    try {
+      setAttachmentTesting(true)
+      setAttachmentResult(null)
+
+      const result = await attachmentSupportService.checkAttachmentSupport(
+        endpoint,
+        endpointMode,
+        apiKeyInput.trim() || undefined,
+        modelName
+      )
+
+      setAttachmentResult({
+        supportsAttachments: result.supportsAttachments,
+        attachmentType: result.attachmentType,
+        message: result.message,
+      })
+    } catch (error) {
+      setAttachmentResult({
+        supportsAttachments: false,
+        message: error instanceof Error ? error.message : '测试失败',
+      })
+    } finally {
+      setAttachmentTesting(false)
     }
   }
 
@@ -290,10 +360,34 @@ export function MainPage() {
       setOutputDir(path)
       await persistUiPreferences({
         lastOutputPath: path,
+        outputFormat: outputFormat,
       })
     } catch (error) {
       setLatestError(getErrorMessage(error, '选择输出目录失败'))
     }
+  }
+
+  async function handleOutputFormatChange(value: 'default' | 'obsidian') {
+    setOutputFormat(value)
+    await persistUiPreferences({
+      outputFormat: value,
+    })
+  }
+
+  function handleSelectZoteroItem(zoteroItems: any[]) {
+    // 将 Zotero 项目转换为 SourceFileRef 格式
+    const convertedFiles: SourceFileRef[] = zoteroItems.map((item, index) => ({
+      id: `zotero-${item.id || index}`,
+      name: item.title || `Zotero Item ${index + 1}`,
+      path: item.filePath || item.url || '',
+      ext: 'pdf' as const, // 默认假设为 PDF 文件
+    }))
+    setFiles(convertedFiles)
+    setShowZoteroPanel(false)
+  }
+
+  function toggleZoteroPanel() {
+    setShowZoteroPanel(!showZoteroPanel)
   }
 
   function handleSelectTemplate(id: string) {
@@ -380,6 +474,7 @@ export function MainPage() {
       setCurrentStage('准备启动任务')
       setIsRunning(true)
       setIsCancelling(false)
+      setProgress(0)
       cancelRequestedRef.current = false
       runAbortControllerRef.current = new AbortController()
 
@@ -421,6 +516,7 @@ export function MainPage() {
           runtimeApiKey,
           signal: runAbortControllerRef.current.signal,
           onStageChange: setCurrentStage,
+          enableChunking: enableChunking,
         })
 
         const singleState: JobState = {
@@ -451,6 +547,7 @@ export function MainPage() {
         setLatestOutputPath(result.outputPath)
         setLatestOutputContent(result.content)
         setLatestChunking(result.chunking)
+        setLatestPaperDirection(result.paperDirection)
         setCurrentStage('任务完成')
         setApiKeyInput('')
         return
@@ -478,6 +575,12 @@ export function MainPage() {
         onProgress: (state) => {
           setJobState(state)
 
+          // 计算进度
+          const total = state.total
+          const completed = state.completed + state.failed + state.skippedCount
+          const progressValue = total > 0 ? Math.round((completed / total) * 100) : 0
+          setProgress(progressValue)
+
           const latestSuccess = [...state.items]
             .reverse()
             .find((item) => item.status === 'success' && item.outputPath)
@@ -499,9 +602,11 @@ export function MainPage() {
         },
         onStageChange: setCurrentStage,
         shouldCancel: () => cancelRequestedRef.current,
+        enableChunking: enableChunking,
       })
 
       setJobState(finalState)
+      setProgress(100)
       setCurrentStage(finalState.cancelled ? '任务已取消' : '批量任务完成')
       setApiKeyInput('')
     } catch (error) {
@@ -544,6 +649,8 @@ export function MainPage() {
           rememberApiKey={rememberApiKey}
           saving={savingConfig}
           testing={testingConnection}
+          attachmentTesting={attachmentTesting}
+          attachmentResult={attachmentResult}
           onProviderTypeChange={setProviderType}
           onEndpointChange={setEndpoint}
           onEndpointModeChange={setEndpointMode}
@@ -553,6 +660,7 @@ export function MainPage() {
           onRememberApiKeyChange={setRememberApiKey}
           onSave={handleSaveConfig}
           onTest={handleTestConnection}
+          onTestAttachment={handleTestAttachment}
         />
 
         <InputSelectorPanel
@@ -563,10 +671,20 @@ export function MainPage() {
           loading={loadingFiles}
           onPickFile={handlePickFile}
           onPickFolder={handlePickFolder}
+          onToggleZotero={toggleZoteroPanel}
           onRecursiveChange={handleRecursiveChange}
         />
 
-        <OutputPanel outputDir={outputDir} onPickOutputDir={handlePickOutputDir} />
+        <OutputPanel 
+          outputDir={outputDir} 
+          outputFormat={outputFormat}
+          onPickOutputDir={handlePickOutputDir} 
+          onOutputFormatChange={handleOutputFormatChange}
+        />
+
+        {showZoteroPanel && (
+          <ZoteroPanel onSelectZoteroItem={handleSelectZoteroItem} />
+        )}
       </div>
 
       <div style={styles.middleColumn}>
@@ -600,11 +718,13 @@ export function MainPage() {
           concurrency={concurrency}
           retryCount={retryCount}
           skipExistingOutput={skipExistingOutput}
+          enableChunking={enableChunking}
           currentFileNames={currentFileNames}
           currentStage={currentStage}
           onConcurrencyChange={handleConcurrencyChange}
           onRetryCountChange={handleRetryCountChange}
           onSkipExistingOutputChange={handleSkipExistingOutputChange}
+          onEnableChunkingChange={setEnableChunking}
           onStart={handleStart}
           onCancel={handleCancel}
         />
@@ -614,8 +734,24 @@ export function MainPage() {
           latestOutputContent={latestOutputContent}
           latestError={latestError}
           latestChunking={latestChunking}
+          latestPaperDirection={latestPaperDirection}
           jobState={jobState}
         />
+
+        <div style={styles.logPanel}>
+          <h3 style={styles.logPanelTitle}>日志输出</h3>
+          <div style={styles.logContent}>
+            {logs.length === 0 ? (
+              <div style={styles.emptyLog}>暂无日志</div>
+            ) : (
+              logs.map((log, index) => (
+                <div key={index} style={styles.logItem}>
+                  {log}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -693,5 +829,32 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: '16px',
+  },
+  logPanel: {
+    background: '#f9fafb',
+    border: '1px solid #e5e7eb',
+    borderRadius: '8px',
+    padding: '12px',
+  },
+  logPanelTitle: {
+    fontSize: '14px',
+    fontWeight: '600',
+    color: '#374151',
+    margin: '0 0 10px 0',
+  },
+  logContent: {
+    maxHeight: '200px',
+    overflowY: 'auto',
+    fontSize: '12px',
+    lineHeight: '1.4',
+  },
+  logItem: {
+    marginBottom: '4px',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-all',
+  },
+  emptyLog: {
+    color: '#6b7280',
+    fontStyle: 'italic',
   },
 }

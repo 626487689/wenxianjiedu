@@ -1,4 +1,4 @@
-export type ModelProviderType = 'openai_compatible'
+export type ModelProviderType = 'openai_compatible' | 'anthropic' | 'google' | 'local'
 
 export type EndpointMode = 'auto' | 'manual'
 
@@ -10,6 +10,7 @@ export interface ModelConfig {
   timeoutMs: number
   temperature?: number
   maxTokens?: number
+  apiKey?: string
 }
 
 export interface BatchConfig {
@@ -18,9 +19,20 @@ export interface BatchConfig {
   skipExistingOutput: boolean
 }
 
+export interface ChunkConfig {
+  enabled: boolean
+  maxChunkSize: number
+  maxChunks: number
+  overlapPages: number
+}
+
+export type OutputFormat = 'default' | 'obsidian'
+
 export interface AppConfig {
   model: ModelConfig
   batch: BatchConfig
+  chunk: ChunkConfig
+  outputFormat: OutputFormat
   apiKeySaved: boolean
   lastInputPath?: string
   lastOutputPath?: string

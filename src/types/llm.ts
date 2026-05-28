@@ -1,3 +1,5 @@
+import type { ModelProviderType } from './config'
+
 export interface ModelRequest {
   endpoint: string
   endpointMode?: 'auto' | 'manual'
@@ -7,7 +9,9 @@ export interface ModelRequest {
   timeoutMs: number
   temperature?: number
   maxTokens?: number
+  providerType?: ModelProviderType
   signal?: AbortSignal
+  onProgress?: (progress: { text: string; done: boolean }) => void
 }
 
 export interface ModelUsage {
