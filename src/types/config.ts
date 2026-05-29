@@ -38,3 +38,17 @@ export interface AppConfig {
   lastOutputPath?: string
   recursiveDefault: boolean
 }
+
+// Multi-model support
+export interface MultiModelEntry {
+  id: string
+  name: string
+  config: ModelConfig
+  enabled: boolean
+  priority: number // lower = higher priority
+}
+
+export interface MultiModelConfig {
+  models: MultiModelEntry[]
+  activeModelId: string | null
+}

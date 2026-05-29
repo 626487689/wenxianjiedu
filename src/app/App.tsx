@@ -1,5 +1,5 @@
-import { MainPage } from '../ui/pages/MainPage'
+import { DashboardPage } from '../ui/pages/DashboardPage'
 
 export default function App() {
-  return <MainPage />
+  return <DashboardPage />
 }

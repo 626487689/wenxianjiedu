@@ -489,8 +489,10 @@ export class OpenAICompatibleClient implements LLMClient {
         const lines = buffer.split(/\r?\n/)
         buffer = lines.pop() || ''
 
+        // Parse raw text into lines for SSE processing
+
         // Detect Anthropic SSE format (uses event: lines)
-        const isAnthropicSSE = lines.some(l => l.trim().startsWith('event:'))
+        const isAnthropicSSE = lines.some((l: string) => l.trim().startsWith('event:'))
 
         if (isAnthropicSSE) {
           // Anthropic SSE: event type + data lines
@@ -813,67 +815,3 @@ function isAbortLikeError(error: unknown): boolean {
 
   return false
 }
-        // Detect Anthropic SSE format (uses event: lines)
-        const isAnthropicSSE = lines.some(l => l.trim().startsWith('event:'))
-
-        if (isAnthropicSSE) {
-          // Anthropic SSE: event type + data lines
-          let currentEvent = ''
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (trimmed.startsWith('event:')) {
-              currentEvent = trimmed.slice(6).trim()
-            } else if (trimmed.startsWith('data:')) {
-              const dataStr = trimmed.slice(5).trim()
-              if (!dataStr || dataStr === '[DONE]') continue
-              try {
-                const data = JSON.parse(dataStr)
-                if (currentEvent === 'content_block_delta' && data.delta?.text) {
-                  const piece = data.delta.text
-                  parts.push(piece)
-                  const now = Date.now()
-                  if (onProgress && (now - lastProgressTime > progressInterval)) {
-                    onProgress({ text: piece, done: false })
-                    lastProgressTime = now
-                  }
-                } else if (currentEvent === 'message_delta' && data.usage) {
-                  usage = data.usage
-                } else if (currentEvent === 'message_start' && data.message?.usage) {
-                  usage = data.message.usage
-                }
-              } catch (error) {
-                logger.error(`Anthropic SSE chunk解析失败: ${error}`)
-              }
-            }
-          }
-        } else {
-          // OpenAI SSE format
-          for (const line of lines) {
-            if (line.trim().startsWith('data:')) {
-              const dataStr = line.trim().slice(5).trim()
-              if (dataStr === '[DONE]') {
-                continue
-              }
-  
-              try {
-                const data = JSON.parse(dataStr)
-                const piece = extractAssistantContent(data)
-                if (piece) {
-                  parts.push(piece)
-                  const now = Date.now()
-                  if (onProgress && (now - lastProgressTime > progressInterval)) {
-                    onProgress({ text: piece, done: false })
-                    lastProgressTime = now
-                  }
-                }
-  
-                if (!usage && data?.usage) {
-                  usage = data.usage
-                }
-              } catch (error) {
-                logger.error(`SSE chunk解析失败: ${error}`)
-                continue
-              }
-            }
-          }
-        }
