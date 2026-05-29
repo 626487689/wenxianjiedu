@@ -43,6 +43,9 @@ export default defineConfig({
     },
   },
   envPrefix: ['VITE_', 'TAURI_'],
+  resolve: {
+    preserveSymlinks: true,
+  },
   build: {
     target: ['es2020', 'chrome105', 'safari13'],
     minify: false,
